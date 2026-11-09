@@ -97,6 +97,14 @@ jobs:
           import numpy as np
 
 
+          def _as_list(v):
+              """官方 .so 返回的字段可能是 numpy array；对其直接做 `x or []` 会抛
+              ValueError: The truth value of an array with more than one element is ambiguous。"""
+              if v is None:
+                  return []
+              return v.tolist() if isinstance(v, np.ndarray) else list(v)
+
+
           def build_deck():
               deck = []
               for i in range(3, 15):
@@ -214,8 +222,8 @@ jobs:
                           "legal_actions": [[int(c) for c in act] for act in infoset.legal_actions],
                           "x": x,
                           "acts": acts,
-                          "current_hand": [int(c) for c in (obs.get("current_hand") or [])],
-                          "actions": list(obs.get("actions") or []),
+                          "current_hand": [int(c) for c in _as_list(obs.get("current_hand"))],
+                          "actions": _as_list(obs.get("actions")),
                       })
                       env.step()
                       n += 1
@@ -287,21 +295,34 @@ jobs:
           print("PASS: official encoder is live")
           PY
 
+      # 容器 job 默认 shell 是 sh（无 pipefail），管道会掩盖 python 的真实退出码，
+      # 让后续 ls 以 code 2 报错。显式指定 bash + pipefail。
       - name: 导出 oracle
+        shell: bash
         working-directory: /tmp/pd/PerfectDou-main
         run: |
+          set -o pipefail
           python "$GITHUB_WORKSPACE/pd_dump_oracle.py" \
             --repo . \
             --games "${{ github.event.inputs.games || '80' }}" \
             --max-items 2000 \
             --out "$GITHUB_WORKSPACE/oracle.pkl.gz" \
             2>&1 | tee "$GITHUB_WORKSPACE/dump.log"
+          test -s "$GITHUB_WORKSPACE/oracle.pkl.gz"
           ls -lh "$GITHUB_WORKSPACE/oracle.pkl.gz"
+
+      # 把真实错误写进 annotation，复制摘要即可拿到全文（日志 zip 需 admin）
+      - name: 失败原因摘要
+        if: failure()
+        shell: bash
+        run: |
+          msg="$(tail -n 25 "$GITHUB_WORKSPACE/dump.log" 2>/dev/null | tr '\n' ' ')"
+          echo "::error::DUMP_LOG: ${msg:-<no dump.log>}"
 
       # 失败时也上传 dump.log，方便直接拿到完整 traceback（GHA 日志 zip 需 admin）
       - name: 上传 artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: pd-oracle
           path: |
