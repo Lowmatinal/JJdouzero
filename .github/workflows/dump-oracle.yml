@@ -222,7 +222,9 @@ jobs:
                           "legal_actions": [[int(c) for c in act] for act in infoset.legal_actions],
                           "x": x,
                           "acts": acts,
-                          "current_hand": [int(c) for c in _as_list(obs.get("current_hand"))],
+                          # 官方 .so 的 current_hand / actions 是 rlcard 字符牌
+                          # （'3' 'T' 'J' 'Q' 'K' 'A' '2' 'B' 'R'），不是整数，原样保留。
+                          "current_hand": _as_list(obs.get("current_hand")),
                           "actions": _as_list(obs.get("actions")),
                       })
                       env.step()
