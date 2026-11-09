@@ -1,0 +1,194 @@
+# -*- coding: utf-8 -*-
+"""在 **Linux** 上导出 PerfectDou 官方编码器的 ground truth（oracle）。
+
+背景
+----
+官方只发布 ``perfectdou/env/encode.cpython-37m-x86_64-linux-gnu.so``，
+Windows 上无法加载（本机 wsl.exe 被安全策略禁用、也没有 Docker）。
+所以我们重建的 ``jjauto/perfectdou.py::state_features/action_features``
+一直没有"标准答案"可以逐位对拍，只能靠 head-to-head 胜率盲猜。
+
+这个脚本就是去拿标准答案：在任意能跑官方 .so 的 Linux 机器上跑一遍随机局，
+把每个决策点的 ``infoset`` 快照 + 官方 ``encode_obs_*`` 的输出一起存下来。
+之后在 Windows 侧用 ``tools/pd_verify_oracle.py`` 逐位比对即可，**一次导出永久可用**。
+
+用法（在 Linux 侧）
+-------------------
+    git clone https://github.com/Netease-Games-AI-Lab-Guangzhou/PerfectDou
+    pip install numpy          # 只需要 numpy，不需要 torch / onnx
+    python3 pd_dump_oracle.py --repo ./PerfectDou --games 300 --out oracle.pkl.gz
+
+    # 省钱方案：GitHub Actions（公开仓库免费）
+    #   runs-on: ubuntu-20.04
+    #   container: python:3.7        # .so 是 py3.7 ABI，必须是 3.7
+    #   run: python3 pd_dump_oracle.py --repo . --games 300 --out oracle.pkl.gz
+    # 然后把这个文件当 artifact 下载回来。
+
+★ 两个硬前提（2026-11-09 补，之前漏了会静默失败）
+--------------------------------------------------
+1) ``--repo`` 必须是**官方仓库根目录**，不能只拷 ``third_party/perfectdou``。
+   官方 ``encode.cpython-37m-...so`` 内部会
+   ``ctypes.CDLL("./libCalculateLeftHands.so")``（.so 里能 grep 到这个字符串），
+   而该文件在官方仓库**根目录**（14,400 B），不在 ``perfectdou/env/`` 下，
+   本地 vendored 目录里也没有。
+2) 因为是 ``./`` 相对路径，运行时 **CWD 必须等于仓库根**。本脚本已自动
+   ``os.chdir(repo)``，并把 ``--out`` 在 chdir 之前固化成绝对路径。
+
+输出
+----
+``oracle.pkl.gz`` = ``{"meta": {...}, "items": [ {决策点...}, ... ]}``，每一项：
+
+    pos                  player_position
+    hand / other_hand_cards / three_landlord_cards
+    num_cards_left_dict  card_play_action_seq  last_move  last_two_moves
+    last_move_dict       played_cards          all_handcards  last_pid  bomb_num
+    legal_actions        具体牌值（list of list）
+    x                    shape (4688,)  官方 x_no_action
+    acts                 shape (150,186) 官方 legal_actions_arr（若为 1 维则原样存）
+    current_hand         官方 obs["current_hand"]
+    actions              官方 obs["actions"]（抽象动作字符串列表）
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import os
+import pickle
+import random
+import sys
+
+import numpy as np
+
+
+def build_deck():
+    deck = []
+    for i in range(3, 15):
+        deck.extend([i] * 4)
+    deck.extend([17] * 4)
+    deck.extend([20, 30])
+    return deck
+
+
+class RandomAgent(object):
+    """均匀随机的合法出牌者——只要它不卡死，局面分布够用来对拍。"""
+
+    def act(self, infoset):
+        return random.choice(infoset.legal_actions)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", required=True, help="PerfectDou 仓库根目录")
+    ap.add_argument("--out", default="oracle.pkl.gz")
+    ap.add_argument("--games", type=int, default=300)
+    ap.add_argument("--seed", type=int, default=20261102)
+    ap.add_argument("--max-per-game", type=int, default=200,
+                    help="每局最多采多少个决策点（防止文件太大）")
+    ap.add_argument("--max-items", type=int, default=2000,
+                    help="★ 总决策点上限。每个点约 130KB（x 4688 + acts 150x186，float32），"
+                         "300 局 × 200 步理论上限 7.8GB，会把 Actions runner(7GB) 撑爆。"
+                         "逐位对拍 2000 点已足够，达到即停。")
+    ap.add_argument("--model-dir", default=None,
+                    help="给了就用 ONNX 模型决策（局面更像真实对局）；不给用随机")
+    a = ap.parse_args()
+
+    repo = os.path.abspath(a.repo)
+    out = os.path.abspath(a.out)   # ★ 必须在 chdir 之前固化，否则相对输出路径会跑偏
+    sys.path.insert(0, repo)
+
+    # 官方 .so 会 ctypes.CDLL("./libCalculateLeftHands.so")（相对当前工作目录）。
+    # 该文件在官方仓库根目录，本地 vendored 的 third_party/perfectdou 没有它。
+    lib = os.path.join(repo, "libCalculateLeftHands.so")
+    if not os.path.isfile(lib):
+        raise SystemExit(
+            "缺少 %s\n"
+            "官方 encode.so 会按 CWD 找 ./libCalculateLeftHands.so（14,400 B，"
+            "在 PerfectDou 仓库根目录）。\n"
+            "请把 --repo 指向完整的官方仓库，而不是只拷了 perfectdou/ 的本地目录。"
+            % lib)
+    print("found %s (%d bytes)" % (lib, os.path.getsize(lib)), flush=True)
+
+    from perfectdou.env.game import GameEnv                        # noqa: E402
+    from perfectdou.env.encode import (                            # noqa: E402
+        encode_obs_landlord, encode_obs_peasant)
+
+    os.chdir(repo)             # ★ 让 "./libCalculateLeftHands.so" 能被找到
+    random.seed(a.seed)
+    np.random.seed(a.seed)
+
+    players = {"landlord": RandomAgent(),
+               "landlord_up": RandomAgent(),
+               "landlord_down": RandomAgent()}
+
+    if a.model_dir:
+        # 用官方 PerfectDou 模型出牌，采样到的局面更接近真实分布
+        sys.path.insert(0, repo)
+        from perfectdou.evaluation.perfectdou_agent import PerfectDouAgent  # noqa: E402
+        players = {p: PerfectDouAgent(p) for p in players}
+
+    deck = build_deck()
+    items = []
+    games_done = 0
+    for g in range(a.games):
+        if len(items) >= a.max_items:
+            print("已达 --max-items=%d，提前结束采样（%d/%d 局）"
+                  % (a.max_items, games_done, a.games), flush=True)
+            break
+        _deck = deck[:]
+        random.shuffle(_deck)
+        data = {"landlord": sorted(_deck[:20]),
+                "landlord_up": sorted(_deck[20:37]),
+                "landlord_down": sorted(_deck[37:54]),
+                "three_landlord_cards": sorted(_deck[17:20])}
+
+        env = GameEnv(players)
+        env.card_play_init(data)
+
+        n = 0
+        while (not env.game_done() and n < a.max_per_game
+               and len(items) < a.max_items):
+            infoset = env.game_infoset
+            pos = infoset.player_position
+            fn = encode_obs_landlord if pos == "landlord" else encode_obs_peasant
+            obs = fn(infoset)
+
+            x = np.asarray(obs["x_no_action"]).ravel().astype(np.float32)
+            acts = np.asarray(obs["legal_actions_arr"]).astype(np.float32)
+            items.append({
+                "pos": pos,
+                "hand": [int(c) for c in infoset.player_hand_cards],
+                "other_hand_cards": [int(c) for c in (infoset.other_hand_cards or [])],
+                "three_landlord_cards": [int(c) for c in (infoset.three_landlord_cards or [])],
+                "num_cards_left_dict": {k: int(v) for k, v in (infoset.num_cards_left_dict or {}).items()},
+                "card_play_action_seq": [[int(c) for c in mv] for mv in (infoset.card_play_action_seq or [])],
+                "last_move": [int(c) for c in (infoset.last_move or [])],
+                "last_two_moves": [[int(c) for c in mv] for mv in (infoset.last_two_moves or [])],
+                "last_move_dict": {k: [int(c) for c in v] for k, v in (infoset.last_move_dict or {}).items()},
+                "played_cards": {k: [int(c) for c in v] for k, v in (infoset.played_cards or {}).items()},
+                "all_handcards": {k: [int(c) for c in v] for k, v in (getattr(infoset, "all_handcards", None) or {}).items()},
+                "last_pid": getattr(infoset, "last_pid", None),
+                "bomb_num": int(getattr(infoset, "bomb_num", 0) or 0),
+                "legal_actions": [[int(c) for c in act] for act in infoset.legal_actions],
+                "x": x,
+                "acts": acts,
+                "current_hand": [int(c) for c in (obs.get("current_hand") or [])],
+                "actions": list(obs.get("actions") or []),
+            })
+            env.step()
+            n += 1
+        games_done += 1
+        if (g + 1) % 25 == 0:
+            print("games=%d items=%d  x=%s acts=%s"
+                  % (games_done, len(items), x.shape, acts.shape), flush=True)
+
+    meta = {"repo": repo, "games": games_done, "items": len(items),
+            "max_items": a.max_items, "seed": a.seed, "used_model": bool(a.model_dir),
+            "n_state": int(items[0]["x"].shape[0]) if items else 0,
+            "acts_shape": list(items[0]["acts"].shape) if items else []}
+    with gzip.open(out, "wb") as f:
+        pickle.dump({"meta": meta, "items": items}, f, protocol=4)
+    print("saved %s  %s" % (out, meta))
+
+
+if __name__ == "__main__":
+    main()
