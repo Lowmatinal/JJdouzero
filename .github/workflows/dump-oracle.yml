@@ -182,8 +182,14 @@ jobs:
                   env.card_play_init(data)
 
                   n = 0
-                  while (not env.game_done() and n < a.max_per_game
+                  # 官方 GameEnv.game_done() 只置 self.game_over=True 且**没有 return**
+                  # （恒为 None）。拿它的返回值判终局永远为真，一局结束后继续 step()
+                  # 会在空手牌 / 空 legal_actions 上抛异常退出（exit 1）。
+                  # 官方 simulation.py 的写法是 `while not env.game_over`。
+                  while (not env.game_over and n < a.max_per_game
                          and len(items) < a.max_items):
+                      if not env.game_infoset.legal_actions:
+                          break
                       infoset = env.game_infoset
                       pos = infoset.player_position
                       fn = encode_obs_landlord if pos == "landlord" else encode_obs_peasant
@@ -288,13 +294,18 @@ jobs:
             --repo . \
             --games "${{ github.event.inputs.games || '80' }}" \
             --max-items 2000 \
-            --out "$GITHUB_WORKSPACE/oracle.pkl.gz"
+            --out "$GITHUB_WORKSPACE/oracle.pkl.gz" \
+            2>&1 | tee "$GITHUB_WORKSPACE/dump.log"
           ls -lh "$GITHUB_WORKSPACE/oracle.pkl.gz"
 
+      # 失败时也上传 dump.log，方便直接拿到完整 traceback（GHA 日志 zip 需 admin）
       - name: 上传 artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pd-oracle
-          path: oracle.pkl.gz
-          if-no-files-found: error
+          path: |
+            oracle.pkl.gz
+            dump.log
+          if-no-files-found: warn
           retention-days: 30
